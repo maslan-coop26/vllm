@@ -5,6 +5,8 @@ import mori
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.distributed import get_dp_group
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.platforms import current_platform
@@ -22,6 +24,28 @@ def _is_stream_capturing() -> bool:
         return False
 
 
+def _dp_rows_bound(ep_size: int, input_num_tokens: int) -> int | None:
+    """Most rows MoRI can deliver to any rank this step.
+
+    Dispatch sends a token at most once per destination rank, so a rank
+    receives at most the sum of the per-rank token counts. Those come from the
+    DP-synced forward context; under CUDA graphs every rank pads to the same
+    count, so a captured bound holds on replay. None unless the counts cover
+    exactly the EP group and this rank's entry matches the rows it dispatches.
+    """
+    if not is_forward_context_available():
+        return None
+    dp_metadata = get_forward_context().dp_metadata
+    if dp_metadata is None:
+        return None
+    counts = dp_metadata.num_tokens_across_dp_cpu
+    if counts is None or counts.numel() != ep_size:
+        return None
+    if int(counts[get_dp_group().rank_in_group]) != input_num_tokens:
+        return None
+    return int(counts.sum())
+
+
 def _trim_dispatch_output(
     dispatch_a1: torch.Tensor,
     dispatch_scale: torch.Tensor | None,
@@ -35,8 +59,14 @@ def _trim_dispatch_output(
     orig_rows = dispatch_a1.shape[0]
 
     if _is_stream_capturing():
-        valid_rows = input_num_tokens * topk * ep_size
+        # The captured shape serves every replay, so it needs a bound, not the
+        # count; the DP-count bound is topk times tighter than tokens x topk x EP.
+        valid_rows = _dp_rows_bound(ep_size, input_num_tokens)
+        if valid_rows is None:
+            valid_rows = input_num_tokens * topk * ep_size
     elif dispatch_recv_token_num is not None and dispatch_recv_token_num.numel() > 0:
+        # Eager steps keep the exact count: a token reaches only some of the
+        # ranks, so the DP-count bound would be well above the rows received.
         valid_rows = int(dispatch_recv_token_num.reshape(-1)[0].item())
     else:
         return dispatch_a1, dispatch_scale, dispatch_ids, dispatch_weights
