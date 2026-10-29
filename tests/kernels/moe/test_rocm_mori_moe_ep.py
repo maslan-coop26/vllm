@@ -217,3 +217,76 @@ def test_mori_dispatch_aiter_combine_trim_regression():
 
     dist.barrier()
     dist.destroy_process_group()
+
+
+def _set_dp_token_counts(monkeypatch, mori_pf, counts, rank):
+    """Make the forward context report `counts` tokens per DP rank (None: no
+    DP metadata) and this process DP rank `rank`."""
+    from types import SimpleNamespace
+
+    dp_metadata = (
+        None
+        if counts is None
+        else SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor(counts))
+    )
+    monkeypatch.setattr(mori_pf, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        mori_pf, "get_forward_context", lambda: SimpleNamespace(dp_metadata=dp_metadata)
+    )
+    monkeypatch.setattr(
+        mori_pf, "get_dp_group", lambda: SimpleNamespace(rank_in_group=rank)
+    )
+
+
+@pytest.mark.parametrize(
+    "counts, rank, input_num_tokens, expected",
+    [
+        ([3, 5, 0, 4], 1, 5, 12),  # the sum of the per-rank token counts
+        ([3, 5, 0, 4], 1, 6, None),  # this rank dispatches rows it did not count
+        ([3, 5], 1, 5, None),  # the counts do not cover the EP group
+        (None, 0, 5, None),  # no DP metadata
+    ],
+)
+def test_dp_rows_bound(monkeypatch, counts, rank, input_num_tokens, expected):
+    from vllm.model_executor.layers.fused_moe.prepare_finalize import mori as mori_pf
+
+    _set_dp_token_counts(monkeypatch, mori_pf, counts, rank)
+    assert mori_pf._dp_rows_bound(4, input_num_tokens) == expected
+
+
+def test_dp_rows_bound_without_forward_context(monkeypatch):
+    from vllm.model_executor.layers.fused_moe.prepare_finalize import mori as mori_pf
+
+    monkeypatch.setattr(mori_pf, "is_forward_context_available", lambda: False)
+    assert mori_pf._dp_rows_bound(4, 5) is None
+
+
+@pytest.mark.parametrize(
+    "capturing, counts, recv, expected_rows",
+    [
+        # Captured: trimmed to the DP-count bound, 12 of 5 x 8 x 4 = 160 rows.
+        (True, [3, 5, 0, 4], None, 12),
+        # Captured without matching counts: tokens x topk x EP, no trim.
+        (True, [3, 6, 0, 4], None, 160),
+        # Eager: the exact received count, below the DP-count bound.
+        (False, [3, 5, 0, 4], 7, 7),
+    ],
+)
+def test_trim_dispatch_output_rows(monkeypatch, capturing, counts, recv, expected_rows):
+    from vllm.model_executor.layers.fused_moe.prepare_finalize import mori as mori_pf
+
+    _set_dp_token_counts(monkeypatch, mori_pf, counts, 1)
+    monkeypatch.setattr(mori_pf, "_is_stream_capturing", lambda: capturing)
+    rows = 5 * 8 * 4
+    a1, scale, ids, weights = mori_pf._trim_dispatch_output(
+        torch.zeros(rows, 16),
+        torch.zeros(rows, 2),
+        torch.zeros(rows, 8, dtype=torch.int32),
+        torch.zeros(rows, 8),
+        None if recv is None else torch.tensor([recv], dtype=torch.int32),
+        ep_size=4,
+        topk=8,
+        input_num_tokens=5,
+    )
+    assert scale is not None
+    assert [t.shape[0] for t in (a1, scale, ids, weights)] == [expected_rows] * 4
