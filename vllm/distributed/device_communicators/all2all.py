@@ -1004,7 +1004,7 @@ class MoriAll2AllManager(All2AllManagerBase):
             kernel_type = mori.ops.EpDispatchCombineKernelType.IntraNode
             rdma_block_num = 0
             warp_num_per_block = 16
-            block_num = 80
+            block_num = envs.VLLM_MORI_INTRANODE_BLOCK_NUM
         else:
             # Multi-node: kernel follows --all2all-backend (mirrors deepep_* split).
             # mori_low_latency → InterNodeV1LL; mori_high_throughput → V1.
